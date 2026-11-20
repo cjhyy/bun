@@ -332,6 +332,24 @@ impl<C: JobContext> Job<C> {
     /// JS thread: build the job, keep the loop alive for it, hand it to the pool.
     #[track_caller]
     pub fn schedule(cx: &JsThread<'_>, off: C::OffThread, js: C::Js) {
+        let job = Self::new(cx, off, js, Some(cx.vm().ticket()));
+        // SAFETY: live until completed/released on this thread; the pool owns it now.
+        unsafe { WorkPool::schedule(&raw mut (*job).task) };
+    }
+
+    /// JS thread: as [`schedule`](Self::schedule), for work that needed no other thread. `off`
+    /// is as [`JobContext::run`] would have left it. [`JobContext::then`] runs where it would
+    /// had the pool posted the job back at once: from the loop's queue, after the caller and
+    /// its microtasks are done ([`EventLoop::enqueue_task_next_turn`](crate::event_loop::EventLoop::enqueue_task_next_turn)).
+    pub fn schedule_finished(cx: &JsThread<'_>, off: C::OffThread, js: C::Js) {
+        let job = Self::new(cx, off, js, None);
+        cx.vm()
+            .event_loop()
+            .enqueue_task_next_turn(bun_event_loop::Task::init(job));
+    }
+
+    /// `ticket`: for the other thread, if the job goes to one.
+    fn new(cx: &JsThread<'_>, off: C::OffThread, js: C::Js, ticket: Option<Ticket>) -> *mut Self {
         let job = bun_core::heap::into_raw(Box::new(Self {
             header: JobHeader {
                 // SAFETY: (this and the entry below) the erased dispatchers are
@@ -352,7 +370,7 @@ impl<C: JobContext> Job<C> {
                 },
                 generation: cx.vm().test_isolation_generation.get(),
             },
-            ticket: Some(cx.vm().ticket()),
+            ticket,
             task: WorkPoolTask {
                 node: Default::default(),
                 callback: Self::run_on_pool,
@@ -362,13 +380,13 @@ impl<C: JobContext> Job<C> {
             off,
             js,
         }));
-        // SAFETY: live until completed/released on this thread; the pool owns it now.
-        unsafe {
-            if C::CANCELLABLE {
-                cx.vm().jobs.with_mut(|j| j.push(&raw mut (*job).header));
-            }
-            WorkPool::schedule(&raw mut (*job).task);
+        if C::CANCELLABLE {
+            // SAFETY: live until completed/released on this thread.
+            cx.vm()
+                .jobs
+                .with_mut(|j| j.push(unsafe { &raw mut (*job).header }));
         }
+        job
     }
 
     fn run_on_pool(task: *mut WorkPoolTask) {

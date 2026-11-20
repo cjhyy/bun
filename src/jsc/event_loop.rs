@@ -78,6 +78,16 @@ pub struct EventLoop {
     /// until the queue is empty (a task that re-posts itself there never lets
     /// the loop poll). Promoted into `tasks` by `auto_tick`, like immediates.
     yield_tasks: Cell<Vec<Task>>,
+    /// Completions of work that finished on this thread at once, where another thread would
+    /// have posted them a moment later ([`Self::enqueue_task_next_turn`]). The next `tick()`
+    /// runs them first thing, like what other threads posted since the last one.
+    next_turn_tasks: Cell<Vec<Task>>,
+    /// As `next_turn_tasks`, enqueued since `auto_tick` began (by an immediate, an I/O callback
+    /// or a timer). The `tick()` that follows is too early for them, it comes before the
+    /// immediates of their turn: that `tick()` moves them to `next_turn_tasks`.
+    turn_after_next_tasks: Cell<Vec<Task>>,
+    /// Whether `auto_tick` has begun since the last `tick()`.
+    in_auto_tick: Cell<bool>,
 
     pub(crate) concurrent_tasks: ConcurrentQueue,
     /// See `TaskTag::is_plugin_request`: as other threads post them, and as this thread has taken them.
@@ -135,6 +145,9 @@ impl EventLoop {
             immediate_tasks: Cell::default(),
             next_immediate_tasks: Cell::default(),
             yield_tasks: Cell::default(),
+            next_turn_tasks: Cell::default(),
+            turn_after_next_tasks: Cell::default(),
+            in_auto_tick: Cell::new(false),
             concurrent_tasks: ConcurrentQueue::default(),
             concurrent_plugin_requests: ConcurrentQueue::default(),
             plugin_requests: UnsafeCell::new(Queue::init()),
@@ -640,6 +653,7 @@ impl EventLoop {
             macro_loop.apply_concurrent_ref_delta();
             let batch = macro_loop.concurrent_tasks.pop_batch();
             Self::take_concurrent_tasks(tasks, batch);
+            macro_loop.move_next_turn_tasks_to(tasks);
         }
 
         let concurrent = self.concurrent_tasks.pop_batch();
@@ -728,6 +742,12 @@ impl EventLoop {
         self.vm_ref().gc_controller.process_gc_timer();
     }
 
+    /// A number that changes whenever the loop polls and whenever it begins another drain of
+    /// its task queue: what ran under one number ran in one go.
+    pub fn iteration_number(&self) -> u64 {
+        self.usockets_loop().iteration_number() + self.task_drains.load(Ordering::Relaxed)
+    }
+
     /// How many times one `tick()` refills the task queue from the concurrent
     /// queue before returning to let the loop poll. Other threads can post
     /// faster than this thread runs what they post; without a bound a steady
@@ -743,6 +763,7 @@ impl EventLoop {
             // SAFETY: a read of the length.
             || unsafe { &*self.plugin_requests.get() }.readable_length() > 0
             || self.has_concurrent_tasks()
+            || self.has_next_turn_tasks()
     }
 
     fn queued_task_count(&self) -> usize {
@@ -800,6 +821,7 @@ impl EventLoop {
         let vm = self.vm_ref();
         self.plugin_request_refills_left
             .set(Self::CONCURRENT_REFILLS_PER_TICK);
+        self.promote_next_turn_tasks();
         self.tick_concurrent();
         vm.gc_controller.process_gc_timer();
 
@@ -957,6 +979,7 @@ impl EventLoop {
                 plugin_requests,
                 self.concurrent_plugin_requests.pop_batch(),
             );
+            self.move_next_turn_tasks_to(tasks);
             let _ = self.promote_yield_tasks();
             while let Some(task) = self.next_task() {
                 // SAFETY: JS thread, heap alive; `task` just left the queue.
@@ -1025,6 +1048,75 @@ impl EventLoop {
             let _ = tasks.write_item(task);
         }
         true
+    }
+
+    /// Queues the completion of work that this thread finished at once, for the place where
+    /// the loop would run it had another thread done the work and posted it right away: the top
+    /// of a `tick()`, after the loop has polled and run the immediates that were queued in the
+    /// same turn. Not the drain that is running, which would never reach the poll while each
+    /// completion starts the next piece of work.
+    pub fn enqueue_task_next_turn(&self, task: Task) {
+        if self.closed_for_tasks.get() {
+            return self.enqueue_task(task);
+        }
+        let tasks = match self.in_auto_tick.get() {
+            true => &self.turn_after_next_tasks,
+            false => &self.next_turn_tasks,
+        };
+        // SAFETY: `push` only allocates.
+        unsafe { &mut *tasks.as_ptr() }.push(task);
+    }
+
+    fn has_own_next_turn_tasks(&self) -> bool {
+        // SAFETY: reads of the lengths.
+        unsafe {
+            !(*self.next_turn_tasks.as_ptr()).is_empty()
+                || !(*self.turn_after_next_tasks.as_ptr()).is_empty()
+        }
+    }
+
+    fn has_next_turn_tasks(&self) -> bool {
+        self.has_own_next_turn_tasks()
+            || self
+                .macro_loop_if_not_running()
+                .is_some_and(Self::has_own_next_turn_tasks)
+    }
+
+    /// For the regular loop, which runs what a macro left behind: see `macro_loop_if_not_running`.
+    fn move_next_turn_tasks_to(&self, tasks: &mut Queue) {
+        for list in [&self.next_turn_tasks, &self.turn_after_next_tasks] {
+            // SAFETY: `drain` and `write_item` only move tasks between queues.
+            for task in unsafe { &mut *list.as_ptr() }.drain(..) {
+                let _ = tasks.write_item(task);
+            }
+        }
+    }
+
+    /// `auto_tick`, first thing: see [`Self::enqueue_task_next_turn`].
+    #[inline]
+    pub fn begin_auto_tick(&self) {
+        self.in_auto_tick.set(true);
+    }
+
+    /// `tick()`, first thing: see [`Self::enqueue_task_next_turn`].
+    fn promote_next_turn_tasks(&self) {
+        self.in_auto_tick.set(false);
+        if !self.has_own_next_turn_tasks() {
+            return;
+        }
+        // SAFETY: tasks are only moved between queues, which allocates at most.
+        let (tasks, next, after_next) = unsafe {
+            (
+                &mut *self.tasks.get(),
+                &mut *self.next_turn_tasks.as_ptr(),
+                &mut *self.turn_after_next_tasks.as_ptr(),
+            )
+        };
+        for task in next.drain(..) {
+            let _ = tasks.write_item(task);
+        }
+        // Both keep their buffers.
+        core::mem::swap(next, after_next);
     }
 
     /// `tickImmediateTasks` — swaps the two
@@ -1329,8 +1421,13 @@ impl EventLoop {
         // `tick()` below can start work (e.g. a --hot reload) whose only wake
         // source is a cross-thread `wakeup()`; bound the park, same as the GC
         // timerfd used to. libuv's `tick_with_timeout` ignores the argument.
+        // Nothing wakes the loop for `next_turn_tasks`.
+        let park_seconds = if self.has_next_turn_tasks() { 0 } else { 1 };
         loop_.tick_with_timeout(
-            Some(&bun_core::Timespec { sec: 1, nsec: 0 }),
+            Some(&bun_core::Timespec {
+                sec: park_seconds,
+                nsec: 0,
+            }),
             uws::NOW_NS_UNKNOWN,
         );
 
@@ -1452,8 +1549,7 @@ pub fn event_loop_exit(global: &JSGlobalObject) {
 // JS thread.
 bun_event_loop::link_impl_JsEventLoop! {
     Jsc for EventLoop => |this| {
-        iteration_number() => (*this).usockets_loop().iteration_number()
-            + (*this).task_drains.load(Ordering::Relaxed),
+        iteration_number() => (*this).iteration_number(),
         uws_loop() => (*this).usockets_loop(),
         event_loop_ctx() => (*this).event_loop_ctx(),
         tick() => (*this).tick(),

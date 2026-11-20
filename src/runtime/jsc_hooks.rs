@@ -98,6 +98,8 @@ pub(crate) struct RuntimeState {
     pub(crate) matcher_pass: Cell<*const crate::test_runner::expect::expect_deferred::Pass>,
     /// For the `node:fs` calls that have no binding object. See [`with_node_fs`].
     node_fs: JsCell<Option<crate::node::fs::NodeFS>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fs_cached_answers: crate::node::fs::CachedAnswerGate,
     /// Installed while `process.on("memoryPressure", ...)` has a listener.
     pub(crate) memory_pressure_watcher: crate::node::memory_pressure::WatcherSlot,
     pub(crate) browsers: crate::webview::Browsers,
@@ -323,6 +325,8 @@ fn init_runtime_state(vm: &VirtualMachine, opts: &InitOptions) -> OpaqueRuntimeS
         test_runner: Cell::new(None),
         matcher_pass: Cell::new(ptr::null()),
         node_fs: JsCell::new(None),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fs_cached_answers: Default::default(),
         memory_pressure_watcher: Default::default(),
         browsers: Default::default(),
         zstd_tables: JsCell::default(),
@@ -742,6 +746,7 @@ fn auto_tick(vm: &VirtualMachine) {
     let el = vm.event_loop();
     let loop_ = el.usockets_loop();
 
+    el.begin_auto_tick();
     // ── tick_immediate_tasks ────────────────────────────────────────────
     // After this call `immediate_tasks` reflects next-tick immediates, so
     // the `has_pending_immediate` read below is correct.
@@ -863,6 +868,7 @@ fn auto_tick_active(vm: &VirtualMachine) {
     let el = vm.event_loop();
     let loop_ = el.usockets_loop();
 
+    el.begin_auto_tick();
     el.tick_immediate_tasks();
     let has_yielded_tasks = el.promote_yield_tasks();
     #[cfg(windows)]

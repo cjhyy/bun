@@ -41,6 +41,9 @@ const helperSrc = `
 #ifndef __NR_close_range
   #define __NR_close_range 436
 #endif
+#ifndef __NR_openat2
+  #define __NR_openat2 437
+#endif
 
 /* instructions between the syscall-nr test and the errno return */
 #ifdef BLOCK_ARG1
@@ -603,4 +606,77 @@ describe.skipIf(!isLinux).each([
       message: `EACCES: permission denied, ${syscall}`,
     });
   });
+});
+
+// The JS thread asks the kernel's caches with `openat2(RESOLVE_CACHED)` in front of the thread
+// pool (`bun_sys::cached`). Where the call is refused, every async operation is the pool's, as
+// on a kernel without it.
+describe.skipIf(!isLinux)("async fs operations when seccomp refuses openat2", () => {
+  const helperBin = tryBuildHelper("__NR_openat2");
+  const snippet = `
+    const fs = require("node:fs");
+    const { getCounters } = require("bun:internal-for-testing");
+    (async () => {
+      const results = [];
+      for (let i = 0; i < 3; i++) {
+        results.push(
+          (await fs.promises.stat("file.txt")).size,
+          (await fs.promises.lstat("link.txt")).isSymbolicLink(),
+          await fs.promises.access("file.txt"),
+          await fs.promises.exists("file.txt"),
+          await fs.promises.exists("missing.txt"),
+          await fs.promises.stat("missing.txt").then(() => "found", e => e.code + " " + e.syscall),
+        );
+      }
+      const { fs_cached_hit, fs_cached_miss } = getCounters();
+      console.log(JSON.stringify({ results, fs_cached_hit, fs_cached_miss }));
+    })();
+  `;
+  const once = [5, true, null, true, false, "ENOENT stat"];
+
+  async function run(errno: number, env: Record<string, string> = {}) {
+    if (helperBin == null) {
+      console.warn("SKIP openat2 seccomp: cc or seccomp headers not available");
+      return null;
+    }
+    using dir = tempDir("openat2-seccomp", { "file.txt": "hello" });
+    symlinkSync("file.txt", join(String(dir), "link.txt"));
+    const out = await runBunUnderSeccomp(helperBin, errno, ["-e", snippet], {
+      cwd: String(dir),
+      env: { ...bunEnv, ...env },
+    });
+    if (out == null) {
+      console.warn("SKIP openat2 seccomp: seccomp not permitted in this environment");
+      return null;
+    }
+    // Don't assert empty stderr — ASAN builds emit a startup warning there.
+    expect({ stdout: out.stdout.trim(), exitCode: out.exitCode }).toEqual({
+      stdout: expect.stringContaining('{"results":'),
+      exitCode: 0,
+    });
+    return JSON.parse(out.stdout.trim());
+  }
+
+  // A pool thread finds the refusal, and the JS thread never asks.
+  test.concurrent.each([
+    ["ENOSYS", ENOSYS],
+    ["EPERM", EPERM],
+    ["EINVAL", EINVAL],
+    ["EACCES", EACCES],
+  ])("with %s, the pool answers", async (_name, errno) => {
+    const result = await run(errno);
+    if (result == null) return;
+    expect(result).toEqual({ results: [...once, ...once, ...once], fs_cached_hit: 0, fs_cached_miss: 0 });
+  });
+
+  // For a policy that kills the process on a call it does not list.
+  test.concurrent.each(["BUN_FEATURE_FLAG_DISABLE_ASYNC_FS_FAST_PATH", "BUN_FEATURE_FLAG_DISABLE_RESOLVE_BENEATH"])(
+    "with %s the call is not made",
+    async flag => {
+      const result = await run(TRAP, { [flag]: "1" });
+      if (result == null) return;
+      expect(result.results).toEqual([...once, ...once, ...once]);
+      expect(result.fs_cached_hit).toBe(0);
+    },
+  );
 });

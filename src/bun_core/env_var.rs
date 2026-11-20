@@ -275,6 +275,8 @@ pub mod feature_flag {
     new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS, "BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS", {});
 
     new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_ADDRCONFIG, "BUN_FEATURE_FLAG_DISABLE_ADDRCONFIG", {});
+    // The pool answers every `node:fs` operation, also one that the kernel could answer from its caches (Linux).
+    new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_ASYNC_FS_FAST_PATH, "BUN_FEATURE_FLAG_DISABLE_ASYNC_FS_FAST_PATH", {});
     new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_ASYNC_TRANSPILER, "BUN_FEATURE_FLAG_DISABLE_ASYNC_TRANSPILER", {});
     new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_DEFERRED_REQUIRE, "BUN_FEATURE_FLAG_DISABLE_DEFERRED_REQUIRE", {});
     new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_SETTLED_FORMAT, "BUN_FEATURE_FLAG_DISABLE_SETTLED_FORMAT", {});
